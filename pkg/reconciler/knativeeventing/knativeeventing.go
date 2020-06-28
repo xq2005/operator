@@ -22,7 +22,6 @@ import (
 
 	mf "github.com/manifestival/manifestival"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	clientset "knative.dev/operator/pkg/client/clientset/versioned"
 
@@ -32,10 +31,6 @@ import (
 	kec "knative.dev/operator/pkg/reconciler/knativeeventing/common"
 	"knative.dev/pkg/logging"
 	pkgreconciler "knative.dev/pkg/reconciler"
-)
-
-const (
-	oldFinalizerName = "delete-knative-eventing-manifest"
 )
 
 // Reconciler implements controller.Reconciler for KnativeEventing resources.
@@ -50,7 +45,7 @@ type Reconciler struct {
 	// client & logger
 	manifest mf.Manifest
 	// Platform-specific behavior to affect the transform
-	platform common.Extension
+	extension common.Extension
 }
 
 // Check that our Reconciler implements controller.Reconciler
@@ -74,6 +69,9 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, original *v1alpha1.Knativ
 		}
 	}
 
+	if err := r.extension.Finalize(ctx, original); err != nil {
+		logger.Error("Failed to finalize platform resources", err)
+	}
 	logger.Info("Deleting cluster-scoped resources")
 	manifest, err := r.installed(ctx, original)
 	if err != nil {
@@ -91,73 +89,28 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, ke *v1alpha1.KnativeEven
 	ke.Status.ObservedGeneration = ke.Generation
 
 	logger.Infow("Reconciling KnativeEventing", "status", ke.Status)
+	if err := r.extension.Reconcile(ctx, ke); err != nil {
+		return err
+	}
 	stages := common.Stages{
 		common.AppendTarget,
 		r.transform,
-		r.ensureFinalizerRemoval,
-		r.install,
-		r.checkDeployments,
-		r.deleteObsoleteResources(ctx, ke),
+		common.Install,
+		common.CheckDeployments,
+		common.DeleteObsoleteResources(ctx, ke, r.installed),
 	}
 	manifest := r.manifest.Append()
 	return stages.Execute(ctx, &manifest, ke)
 }
 
-// transform mutates the passed manifest to one with common and
-// platform transforms, plus any extras passed in
+// transform mutates the passed manifest to one with common, component
+// and platform transformations applied
 func (r *Reconciler) transform(ctx context.Context, manifest *mf.Manifest, comp v1alpha1.KComponent) error {
 	logger := logging.FromContext(ctx)
 	instance := comp.(*v1alpha1.KnativeEventing)
-	return common.Transform(ctx, manifest, instance, r.platform,
-		kec.DefaultBrokerConfigMapTransform(instance, logger))
-}
-
-// ensureFinalizerRemoval ensures that the obsolete "delete-knative-eventing-manifest" is removed from the resource.
-func (r *Reconciler) ensureFinalizerRemoval(_ context.Context, _ *mf.Manifest, instance v1alpha1.KComponent) error {
-	patch, err := common.FinalizerRemovalPatch(instance, oldFinalizerName)
-	if err != nil {
-		return fmt.Errorf("failed to construct the patch: %w", err)
-	}
-	if patch == nil {
-		// Nothing to do here.
-		return nil
-	}
-
-	patcher := r.operatorClientSet.OperatorV1alpha1().KnativeEventings(instance.GetNamespace())
-	if _, err := patcher.Patch(instance.GetName(), types.MergePatchType, patch); err != nil {
-		return fmt.Errorf("failed to patch finalizer away: %w", err)
-	}
-	return nil
-}
-
-func (r *Reconciler) install(ctx context.Context, manifest *mf.Manifest, ke v1alpha1.KComponent) error {
-	logger := logging.FromContext(ctx)
-	logger.Debug("Installing manifest")
-	return common.Install(manifest, common.TargetVersion(ke), ke.GetStatus())
-}
-
-func (r *Reconciler) checkDeployments(ctx context.Context, manifest *mf.Manifest, ke v1alpha1.KComponent) error {
-	logger := logging.FromContext(ctx)
-	logger.Debug("Checking deployments")
-	return common.CheckDeployments(r.kubeClientSet, manifest, ke.GetStatus())
-}
-
-// deleteObsoleteResources returns a Stage after calculating the
-// installed manifest from the instance, but *before* any other stages
-// might mutate the instance's status.version.
-func (r *Reconciler) deleteObsoleteResources(ctx context.Context, instance v1alpha1.KComponent) common.Stage {
-	if common.TargetVersion(instance) == instance.GetStatus().GetVersion() {
-		return common.NoOp
-	}
-	logger := logging.FromContext(ctx)
-	installed, err := r.installed(ctx, instance)
-	if err != nil {
-		logger.Error("Unable to obtain the installed manifest; obsolete resources may linger", err)
-		return common.NoOp
-	}
-	return func(_ context.Context, manifest *mf.Manifest, _ v1alpha1.KComponent) error {
-		return installed.Filter(mf.None(mf.In(*manifest))).Delete()
-	}
+	extra := []mf.Transformer{kec.DefaultBrokerConfigMapTransform(instance, logger)}
+	extra = append(extra, r.extension.Transformers(instance)...)
+	return common.Transform(ctx, manifest, instance, extra...)
 }
 
 func (r *Reconciler) installed(ctx context.Context, instance v1alpha1.KComponent) (*mf.Manifest, error) {
